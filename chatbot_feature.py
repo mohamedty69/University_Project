@@ -1,31 +1,57 @@
 import time 
 import os
+import json
+import re
 
+from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from openai import OpenAI, APIError, APIConnectionError
+from functools import wraps
 
 
-client = None
+app = FastAPI()
 load_dotenv()
+CLIENT = None
+INT_SYS_PROMPT, GEN_SYS_PROMPT, DATA_SYS_PROMPT = None, None, None
 
 
-def main():
-    global client
-    client = get_client()
-    print(get_completion("Explain the enrollment process."))
+class UserPrompt(BaseModel):
+    user_input: str
+    user_id: str
 
 
-def handle_deepseek_errors(func):
-    """
-    Decorator to handle DeepSeek API errors and retry logic.
-    """
-    def wrapper(*args, **kwargs):
+class FormatRequest(BaseModel):
+    original_query: str
+    db_results: str
+
+
+def get_client():
+    """Initialize the OpenAI client with the API key and base URL."""
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise ValueError("""
+        Missing API key! Please:
+        1. Create .env file
+        2. Add DEEPSEEK_API_KEY=your_key
+        """)
+    
+    return OpenAI(api_key=api_key,
+        base_url=os.getenv("BASE_URL", "https://api.deepseek.com/v1")
+    )
+
+
+def handle_deepseek_errors(func): # `func` is the function to be decorated (e.g., `chat_endpoint`)
+    """Decorator to handle DeepSeek API errors and retry logic."""
+    @wraps(func)
+    def wrapper(*args, **kwargs): # `args` and `kwargs` are the arguments passed to the function `func`
+        """Wrapper function to handle errors and retries."""
         max_retries = 3
         retry_delay = 2
 
         for attempt in range(max_retries):
             try:
-                return func(*args, **kwargs)
+                return func(*args, **kwargs) # Call the original function `func`, in this case chat_endpoint, with its arguments
             except APIError as e:
                 error_data = e.response.json() if e.response else {}
                 error_message = error_data.get('error', {}).get('message', 'Unknown error')
@@ -76,45 +102,121 @@ def handle_deepseek_errors(func):
                     continue
                 return "Network connection failed"
             
-        return "Maximum retries exceeded. Please try again later."
+        return func(*args, **kwargs)
     return wrapper
 
 
-def get_client():
-    """
-    Initialize the OpenAI client with the API key and base URL.
-    """
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise ValueError("""
-        Missing API key! Please:
-        1. Create .env file
-        2. Add DEEPSEEK_API_KEY=your_key
-        """)
+@app.on_event("startup")
+async def startup_event():
+    """Load environment variables and initialize the DeepSeek client."""
+    global CLIENT, INT_SYS_PROMPT, GEN_SYS_PROMPT, DATA_SYS_PROMPT
+    CLIENT = get_client()
+    context = load_context()
+    INT_SYS_PROMPT, GEN_SYS_PROMPT = context[0], context[1]
+    DATA_SYS_PROMPT = "Your task if to write a SQL query for user_id={user_id} using the schema:"
+    DATA_SYS_PROMPT += f"\n{context[2]}"
+    DATA_SYS_PROMPT += """Answer with a JSON string complying with the following format:
+{
+    "query": "SELECT * FROM table WHERE condition",
+}"""
+
+
+@app.post("/chat")
+@handle_deepseek_errors
+def chat_endpoint(request: UserPrompt):
+    """Chatbot endpoint to handle user queries."""
+    if analyze_intent(request.user_input):
+        sql_query = generate_sql(request)
+        return {"action": "execute_sql", "query": sql_query}
+    else:
+        return generate_response(request.user_input)
     
-    return OpenAI(api_key=api_key,
-        base_url=os.getenv("BASE_URL", "https://api.deepseek.com/v1")
+
+@app.post("/format-response")
+@handle_deepseek_errors
+def format_results(request: FormatRequest):
+    """Format the SQL query results into a user-friendly response."""
+    formatting_prompt = f"""
+    Original SQL query: {request.original_query}
+    Database result: {json.dumps(request.db_results)}
+
+    Format as markdown table with:
+    - Student-friendly emojis
+    - Hidden technical details
+    - Clear section headings 
+    """
+    response = CLIENT.chat.completions.create(
+        model="deepseek/deepseek-chat-v3-0324:free",
+        messages=[{"role": "system", "content": GEN_SYS_PROMPT}, 
+                  {"role": "user", "content": formatting_prompt}],
+        temperature=0.2,
+    )
+    return {"formatted_response": response.choices[0].message.content}
+
+
+def analyze_intent(user_input: str) -> dict:
+    """Analyze the user's intent based on the input."""
+    response = CLIENT.chat.completions.create(
+        model="deepseek/deepseek-chat-v3-0324:free",
+        messages=[{"role": "system", "content": INT_SYS_PROMPT}, 
+                  {"role": "user", "content": user_input}], 
+        temperature=0.1,
     )
 
+    requires_data = response.choices[0].message.content.strip().lower()
+    try:
+        if requires_data not in ["true", "false"]:
+            raise ValueError("Invalid response format")
+        return requires_data == "true"
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid response format from intent analysis. Error: {str(e)}")
 
-@handle_deepseek_errors
-def get_completion(user_prompt):
-    """
-    Get a response from the DeepSeek API based on the user prompt.
-    """
-    with open("context.txt", 'r') as file:
-        system_prompt = file.read()
-        
-    response = client.chat.completions.create(
+
+def generate_response(user_input: str) -> str:
+    response = CLIENT.chat.completions.create(
         model="deepseek/deepseek-chat-v3-0324:free",
-        messages=[{"role": "system", "content": system_prompt}, 
-                    {"role": "user", "content": user_prompt}], 
+        messages=[{"role": "system", "content": GEN_SYS_PROMPT}, 
+                  {"role": "user", "content": user_input}], 
         temperature=0.3, top_p=0.6, 
         frequency_penalty=0.4, presence_penalty=0.2,
         max_tokens=400,
     )
-    return(response.choices[0].message.content)
+    return {"response": response.choices[0].message.content}
+
+
+def generate_sql(request: UserPrompt) -> str:
+    system_prompt = DATA_SYS_PROMPT.format(user_id=request.user_id)
+    response = CLIENT.chat.completions.create(
+        model="deepseek/deepseek-chat-v3-0324:free",
+        messages=[{"role": "system", "content": system_prompt}, 
+                  {"role": "user", "content": request.user_input}], 
+        temperature=0.0, max_tokens=400,
+    )
+    sql_query = (response.choices[0].message.content)
+    if not validate_sql(sql_query, request.user_id):
+        raise HTTPException(status_code=301, detail="Invalid SQL query generated. Output:\n" + sql_query)
+    return sql_query
+
+
+def validate_sql(sql_query: str, user_id: str) -> bool:
+    sql_query = sql_query.upper().strip()
+    forbidden_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE"]
+    return (sql_query.startswith("SELECT") and f"s_id = {user_id}" in sql_query.lower() and
+            not any(keyword in sql_query for keyword in forbidden_keywords))
+
+
+def load_context():
+    """Load system prompts from the context file."""
+    with open("context.txt", 'r', encoding='utf-8') as f:
+        content = f.read()
+    parts = re.split(r'### (INTENT|GENERAL|SQL) SYSTEM PROMPT ###', content)
+    
+    intent_section = parts[2].strip() if len(parts) > 1 else ""
+    general_section = parts[4].strip() if len(parts) > 3 else ""
+    schema = parts[6].strip() if len(parts) > 5 else ""
+    return intent_section, general_section, schema
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
